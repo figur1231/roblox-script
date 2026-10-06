@@ -1,172 +1,692 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
 local LocalPlayer = Players.LocalPlayer
 local Mouse = LocalPlayer:GetMouse()
 
-local CurrentPart = nil
-local CurrentHighlight = nil
-local CharacterConnection = nil
-local PartConnection = nil
-local HeartbeatConnection = nil
+local CONFIG = {
+    COLOR_OWNED = Color3.fromRGB(0, 255, 0),
+    COLOR_NOT_OWNED = Color3.fromRGB(150, 150, 150),
+    FILL_TRANSPARENCY = 0.7,
+    OUTLINE_TRANSPARENCY = 0.3,
+    GUI_NAME = "PartControlGui",
+    GUI_TITLE = "Part Control v2.0",
+    GUI_SIZE = UDim2.new(0, 320, 0, 460),
+    GUI_POSITION = UDim2.new(0, 20, 0, 20),
+    KEY_TOGGLE_GUI = Enum.KeyCode.RightControl,
+    KEY_RELEASE = Enum.KeyCode.R,
+    KEY_AUTO_CATCH = Enum.KeyCode.F,
+    KEY_TELEPORT = Enum.KeyCode.T,
+    KEY_HISTORY = Enum.KeyCode.H,
+    AUTO_CATCH_RADIUS = 50,
+    MAX_HISTORY = 10,
+    LOG_MAX_LINES = 50,
+    HEARTBEAT_UPDATE_RATE = 0.1,
+}
 
-local COLOR_OWNED = Color3.fromRGB(0, 255, 0)
-local COLOR_NOT_OWNED = Color3.fromRGB(150, 150, 150)
+local State = {
+    CurrentPart = nil,
+    CurrentHighlight = nil,
+    CurrentWeld = nil,
+    CharacterConnection = nil,
+    HeartbeatConnection = nil,
+    InputConnection = nil,
+    ClickConnection = nil,
+    Gui = nil,
+    GuiVisible = true,
+    History = {},
+    Log = {},
+    Stats = {
+        Clicks = 0,
+        Captures = 0,
+        Releases = 0,
+        Errors = 0,
+        StartTime = tick(),
+    },
+    LastHeartbeatUpdate = 0,
+    Dragging = false,
+    DragStart = nil,
+    DragStartPos = nil,
+}
 
-local function ReleaseCurrentPart()
-    if CharacterConnection then
-        CharacterConnection:Disconnect()
-        CharacterConnection = nil
+local Utils = {}
+
+function Utils.safeCall(fn, ...)
+    local args = {...}
+    local ok, result = pcall(function()
+        return fn(table.unpack(args))
+    end)
+    if not ok then
+        State.Stats.Errors = State.Stats.Errors + 1
+        warn("[PartControl] " .. tostring(result))
     end
+    return ok, result
+end
 
-    if PartConnection then
-        PartConnection:Disconnect()
-        PartConnection = nil
-    end
+function Utils.round(num, decimals)
+    local mult = 10 ^ (decimals or 0)
+    return math.floor(num * mult + 0.5) / mult
+end
 
-    if HeartbeatConnection then
-        HeartbeatConnection:Disconnect()
-        HeartbeatConnection = nil
-    end
+function Utils.formatTime(seconds)
+    local mins = math.floor(seconds / 60)
+    local secs = math.floor(seconds % 60)
+    return string.format("%02d:%02d", mins, secs)
+end
 
-    if CurrentHighlight and CurrentHighlight.Parent then
-        CurrentHighlight:Destroy()
-    end
-    CurrentHighlight = nil
+function Utils.getCharacter()
+    return LocalPlayer.Character
+end
 
-    if CurrentPart then
-        local character = LocalPlayer.Character
-        if character then
-            local rootPart = character:FindFirstChild("HumanoidRootPart")
-            if rootPart then
-                local weld = rootPart:FindFirstChild("PartWeld")
-                if weld then
-                    weld:Destroy()
-                end
+function Utils.getRootPart()
+    local char = Utils.getCharacter()
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+function Utils.getHumanoid()
+    local char = Utils.getCharacter()
+    if not char then return nil end
+    return char:FindFirstChildOfClass("Humanoid")
+end
+
+function Utils.isAlive()
+    local hum = Utils.getHumanoid()
+    if not hum then return false end
+    return hum.Health > 0
+end
+
+function Utils.distance(a, b)
+    if not a or not b then return math.huge end
+    return (a.Position - b.Position).Magnitude
+end
+
+function Utils.isPartValid(part)
+    if not part then return false end
+    if not part:IsA("BasePart") then return false end
+    if not part.Parent then return false end
+    if part.Anchored then return false end
+    return true
+end
+
+function Utils.isPartOfCharacter(part)
+    if not part then return false end
+    local char = Utils.getCharacter()
+    if not char then return false end
+    return part:IsDescendantOf(char)
+end
+
+function Utils.findNearestPart()
+    local root = Utils.getRootPart()
+    if not root then return nil end
+    local nearest = nil
+    local nearestDist = CONFIG.AUTO_CATCH_RADIUS
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and not obj.Anchored and not Utils.isPartOfCharacter(obj) then
+            local d = Utils.distance(root, obj)
+            if d < nearestDist then
+                nearestDist = d
+                nearest = obj
             end
         end
     end
-
-    CurrentPart = nil
+    return nearest
 end
 
-local function IsClientOwned(part)
-    if part == CurrentPart then
-        return true
-    end
+local Logger = {}
 
-    if part.ReceiveAge ~= nil then
-        return part.ReceiveAge < 0.1
+function Logger.add(message, level)
+    level = level or "INFO"
+    local timestamp = os.date("%H:%M:%S")
+    local entry = string.format("[%s] [%s] %s", timestamp, level, message)
+    table.insert(State.Log, entry)
+    if #State.Log > CONFIG.LOG_MAX_LINES then
+        table.remove(State.Log, 1)
     end
+    print(entry)
+    if State.Gui and State.Gui.LogLabel then
+        State.Gui.LogLabel.Text = table.concat(State.Log, "\n")
+    end
+end
 
+function Logger.info(msg) Logger.add(msg, "INFO") end
+function Logger.warn(msg) Logger.add(msg, "WARN") end
+function Logger.error(msg) Logger.add(msg, "ERROR") end
+function Logger.success(msg) Logger.add(msg, "OK") end
+
+local History = {}
+
+function History.add(part)
+    if not part then return end
+    for i, v in ipairs(State.History) do
+        if v == part then
+            table.remove(State.History, i)
+            break
+        end
+    end
+    table.insert(State.History, 1, part)
+    while #State.History > CONFIG.MAX_HISTORY do
+        table.remove(State.History)
+    end
+end
+
+function History.clear()
+    State.History = {}
+end
+
+local Highlight = {}
+
+function Highlight.isClientOwned(part)
+    if not part then return false end
+    if part == State.CurrentPart then return true end
+    local ok, age = pcall(function()
+        return part.ReceiveAge
+    end)
+    if ok and age then
+        return age < 0.1
+    end
     return false
 end
 
-local function UpdateHighlight(part)
-    if not part or not part.Parent then return end
-
-    if not CurrentHighlight or CurrentHighlight.Adornee ~= part then
-        if CurrentHighlight then
-            CurrentHighlight:Destroy()
-        end
-
-        CurrentHighlight = Instance.new("Highlight")
-        CurrentHighlight.Adornee = part
-        CurrentHighlight.FillTransparency = 0.7
-        CurrentHighlight.OutlineTransparency = 0.3
-        CurrentHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        CurrentHighlight.Parent = part
+function Highlight.create(part)
+    if not part or not part.Parent then return nil end
+    if State.CurrentHighlight and State.CurrentHighlight.Parent then
+        State.CurrentHighlight:Destroy()
     end
-
-    if IsClientOwned(part) then
-        CurrentHighlight.FillColor = COLOR_OWNED
-        CurrentHighlight.OutlineColor = COLOR_OWNED
-    else
-        CurrentHighlight.FillColor = COLOR_NOT_OWNED
-        CurrentHighlight.OutlineColor = COLOR_NOT_OWNED
-    end
+    local hl = Instance.new("Highlight")
+    hl.Name = "PartControlHighlight"
+    hl.Adornee = part
+    hl.FillTransparency = CONFIG.FILL_TRANSPARENCY
+    hl.OutlineTransparency = CONFIG.OUTLINE_TRANSPARENCY
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = part
+    State.CurrentHighlight = hl
+    return hl
 end
 
-local function BecomePart(part)
-    if not part or not part:IsA("BasePart") then return end
-    if part.Anchored then
-        warn("Парт заанкорен, нельзя забрать владение")
+function Highlight.update(part)
+    if not part or not part.Parent then return end
+    if not State.CurrentHighlight or not State.CurrentHighlight.Parent then
+        Highlight.create(part)
         return
     end
+    if Highlight.isClientOwned(part) then
+        State.CurrentHighlight.FillColor = CONFIG.COLOR_OWNED
+        State.CurrentHighlight.OutlineColor = CONFIG.COLOR_OWNED
+    else
+        State.CurrentHighlight.FillColor = CONFIG.COLOR_NOT_OWNED
+        State.CurrentHighlight.OutlineColor = CONFIG.COLOR_NOT_OWNED
+    end
+end
 
-    ReleaseCurrentPart()
+function Highlight.destroy()
+    if State.CurrentHighlight and State.CurrentHighlight.Parent then
+        State.CurrentHighlight:Destroy()
+    end
+    State.CurrentHighlight = nil
+end
 
-    CurrentPart = part
+local Weld = {}
 
-    UpdateHighlight(part)
-
-    local character = LocalPlayer.Character
-    if not character then return end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local rootPart = character:FindFirstChild("HumanoidRootPart")
-
-    if not rootPart then return end
-
-    local weld = Instance.new("WeldConstraint")
-    weld.Name = "PartWeld"
+function Weld.attach(rootPart, targetPart)
+    if not rootPart or not targetPart then return nil end
+    if not rootPart.Parent or not targetPart.Parent then return nil end
+    Weld.detach()
+    local weld = Instance.new("Weld")
+    weld.Name = "PartControlWeld"
     weld.Part0 = rootPart
-    weld.Part1 = part
+    weld.Part1 = targetPart
+    weld.C0 = rootPart.CFrame:ToObjectSpace(targetPart.CFrame)
+    weld.C1 = CFrame.new()
     weld.Parent = rootPart
+    State.CurrentWeld = weld
+    return weld
+end
 
-    PartConnection = RunService.Heartbeat:Connect(function()
-        if CurrentPart and CurrentPart.Parent then
-            UpdateHighlight(CurrentPart)
-        else
-            ReleaseCurrentPart()
+function Weld.detach()
+    if State.CurrentWeld and State.CurrentWeld.Parent then
+        State.CurrentWeld:Destroy()
+    end
+    State.CurrentWeld = nil
+end
+
+local Core = {}
+
+function Core.release()
+    if State.CharacterConnection then
+        State.CharacterConnection:Disconnect()
+        State.CharacterConnection = nil
+    end
+    if State.HeartbeatConnection then
+        State.HeartbeatConnection:Disconnect()
+        State.HeartbeatConnection = nil
+    end
+    Highlight.destroy()
+    Weld.detach()
+    if State.CurrentPart then
+        Logger.info("Отпущен парт: " .. State.CurrentPart.Name)
+        State.Stats.Releases = State.Stats.Releases + 1
+    end
+    State.CurrentPart = nil
+    if State.Gui and State.Gui.StatusLabel then
+        State.Gui.StatusLabel.Text = "Статус: свободен"
+        State.Gui.StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    end
+end
+
+function Core.attachWeldOnRespawn(newCharacter)
+    if not State.CurrentPart or not State.CurrentPart.Parent then return end
+    local newRoot = newCharacter:WaitForChild("HumanoidRootPart", 5)
+    if newRoot then
+        Weld.attach(newRoot, State.CurrentPart)
+        Logger.info("Персонаж перепривязан после респавна")
+    end
+end
+
+function Core.becomePart(part)
+    if not Utils.isPartValid(part) then
+        Logger.warn("Парт невалиден или заанкорен")
+        return false
+    end
+    if Utils.isPartOfCharacter(part) then
+        Logger.warn("Нельзя стать частью своего персонажа")
+        return false
+    end
+    if part == State.CurrentPart then
+        Logger.info("Уже управляете этим партом")
+        return false
+    end
+    Core.release()
+    State.CurrentPart = part
+    History.add(part)
+    State.Stats.Captures = State.Stats.Captures + 1
+    Highlight.create(part)
+    Highlight.update(part)
+    local rootPart = Utils.getRootPart()
+    if not rootPart then
+        Logger.error("Не найден HumanoidRootPart")
+        return false
+    end
+    Weld.attach(rootPart, part)
+    State.HeartbeatConnection = RunService.Heartbeat:Connect(function()
+        local now = tick()
+        if now - State.LastHeartbeatUpdate < CONFIG.HEARTBEAT_UPDATE_RATE then
+            return
         end
-    end)
-
-    HeartbeatConnection = RunService.Heartbeat:Connect(function()
-        if CurrentPart and CurrentPart.Parent then
-            local char = LocalPlayer.Character
-            if char then
-                local rp = char:FindFirstChild("HumanoidRootPart")
-                if rp then
-                    local existingWeld = rp:FindFirstChild("PartWeld")
-                    if not existingWeld then
-                        local newWeld = Instance.new("WeldConstraint")
-                        newWeld.Name = "PartWeld"
-                        newWeld.Part0 = rp
-                        newWeld.Part1 = CurrentPart
-                        newWeld.Parent = rp
-                    end
+        State.LastHeartbeatUpdate = now
+        if State.CurrentPart and State.CurrentPart.Parent then
+            Highlight.update(State.CurrentPart)
+            if State.Gui and State.Gui.InfoLabel then
+                local root = Utils.getRootPart()
+                if root then
+                    local d = Utils.round(Utils.distance(root, State.CurrentPart), 1)
+                    State.Gui.InfoLabel.Text = string.format("Парт: %s | Дист: %s | Скор: %s",
+                        State.CurrentPart.Name,
+                        tostring(d),
+                        tostring(Utils.round(State.CurrentPart.AssemblyLinearVelocity.Magnitude, 1))
+                    )
                 end
             end
+        else
+            Core.release()
         end
     end)
-
-    CharacterConnection = LocalPlayer.CharacterAdded:Connect(function(newCharacter)
-        if CurrentPart and CurrentPart.Parent then
-            local newRoot = newCharacter:WaitForChild("HumanoidRootPart", 5)
-            if newRoot then
-                local newWeld = Instance.new("WeldConstraint")
-                newWeld.Name = "PartWeld"
-                newWeld.Part0 = newRoot
-                newWeld.Part1 = CurrentPart
-                newWeld.Parent = newRoot
-            end
-        end
+    State.CharacterConnection = LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+        Core.attachWeldOnRespawn(newCharacter)
     end)
-
-    print("Теперь вы управляете партом:", part.Name)
-end
-
-Mouse.Button1Down:Connect(function()
-    local target = Mouse.Target
-    if target and target:IsA("BasePart") then
-        BecomePart(target)
+    if State.Gui and State.Gui.StatusLabel then
+        State.Gui.StatusLabel.Text = "Статус: управляю " .. part.Name
+        State.Gui.StatusLabel.TextColor3 = CONFIG.COLOR_OWNED
     end
-end)
-
-local function Cleanup()
-    ReleaseCurrentPart()
+    Logger.success("Теперь вы управляете партом: " .. part.Name)
+    return true
 end
 
-return Cleanup
+function Core.teleportToPart()
+    if not State.CurrentPart or not State.CurrentPart.Parent then
+        Logger.warn("Нет активного парта")
+        return
+    end
+    local root = Utils.getRootPart()
+    if not root then return end
+    local targetPos = State.CurrentPart.Position + Vector3.new(0, 5, 0)
+    root.CFrame = CFrame.new(targetPos)
+    Logger.info("Телепорт к парту")
+end
+
+function Core.autoCatch()
+    local part = Utils.findNearestPart()
+    if part then
+        Core.becomePart(part)
+    else
+        Logger.warn("Ближайший парт не найден")
+    end
+end
+
+local Gui = {}
+
+function Gui.createButton(parent, text, position, size, color, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = size
+    btn.Position = position
+    btn.BackgroundColor3 = color or Color3.fromRGB(45, 45, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.TextSize = 14
+    btn.Font = Enum.Font.GothamBold
+    btn.Parent = parent
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = btn
+    
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+        }):Play()
+    end)
+    
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.15), {
+            BackgroundColor3 = color or Color3.fromRGB(45, 45, 55)
+        }):Play()
+    end)
+    
+    btn.MouseButton1Click:Connect(function()
+        Utils.safeCall(callback)
+    end)
+    
+    return btn
+end
+
+function Gui.createLabel(parent, text, position, size, textSize, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = size
+    lbl.Position = position
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = color or Color3.fromRGB(220, 220, 220)
+    lbl.TextSize = textSize or 13
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = parent
+    return lbl
+end
+
+function Gui.build()
+    if State.Gui and State.Gui.Main then
+        State.Gui.Main:Destroy()
+    end
+    
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = CONFIG.GUI_NAME
+    screenGui.ResetOnSpawn = false
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    local ok = pcall(function()
+        screenGui.Parent = game:GetService("CoreGui")
+    end)
+    if not ok then
+        screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+    
+    local main = Instance.new("Frame")
+    main.Name = "Main"
+    main.Size = CONFIG.GUI_SIZE
+    main.Position = CONFIG.GUI_POSITION
+    main.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+    main.BorderSizePixel = 0
+    main.Active = true
+    main.Draggable = true
+    main.Parent = screenGui
+    
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 10)
+    mainCorner.Parent = main
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(80, 80, 120)
+    stroke.Thickness = 1
+    stroke.Parent = main
+    
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 36)
+    titleBar.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = main
+    
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 10)
+    titleCorner.Parent = titleBar
+    
+    local titleCover = Instance.new("Frame")
+    titleCover.Size = UDim2.new(1, 0, 0, 10)
+    titleCover.Position = UDim2.new(0, 0, 1, -10)
+    titleCover.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    titleCover.BorderSizePixel = 0
+    titleCover.Parent = titleBar
+    
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -40, 1, 0)
+    title.Position = UDim2.new(0, 12, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = CONFIG.GUI_TITLE
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextSize = 15
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = titleBar
+    
+    local statusLabel = Gui.createLabel(main, "Статус: свободен", UDim2.new(0, 12, 0, 46), UDim2.new(1, -24, 0, 22), 14, Color3.fromRGB(200, 200, 200))
+    
+    local infoLabel = Gui.createLabel(main, "Парт: — | Дист: — | Скор: —", UDim2.new(0, 12, 0, 68), UDim2.new(1, -24, 0, 20), 12, Color3.fromRGB(170, 170, 190))
+    
+    local statsLabel = Gui.createLabel(main, "Клики: 0 | Захваты: 0 | Отпуски: 0", UDim2.new(0, 12, 0, 90), UDim2.new(1, -24, 0, 20), 12, Color3.fromRGB(150, 200, 150))
+    
+    local separator = Instance.new("Frame")
+    separator.Size = UDim2.new(1, -24, 0, 1)
+    separator.Position = UDim2.new(0, 12, 0, 116)
+    separator.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+    separator.BorderSizePixel = 0
+    separator.Parent = main
+    
+    local btn1 = Gui.createButton(main, "Захватить ближайший [F]", UDim2.new(0, 12, 0, 126), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(40, 80, 50), function()
+        Core.autoCatch()
+    end)
+    
+    local btn2 = Gui.createButton(main, "Отпустить [R]", UDim2.new(0.5, 6, 0, 126), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(80, 40, 40), function()
+        Core.release()
+    end)
+    
+    local btn3 = Gui.createButton(main, "Телепорт к парту [T]", UDim2.new(0, 12, 0, 168), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(40, 60, 100), function()
+        Core.teleportToPart()
+    end)
+    
+    local btn4 = Gui.createButton(main, "Очистить историю", UDim2.new(0.5, 6, 0, 168), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(60, 60, 60), function()
+        History.clear()
+        Logger.info("История очищена")
+    end)
+    
+    local historyLabel = Gui.createLabel(main, "История:", UDim2.new(0, 12, 0, 212), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
+    
+    local historyFrame = Instance.new("ScrollingFrame")
+    historyFrame.Size = UDim2.new(1, -24, 0, 80)
+    historyFrame.Position = UDim2.new(0, 12, 0, 234)
+    historyFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    historyFrame.BorderSizePixel = 0
+    historyFrame.ScrollBarThickness = 4
+    historyFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    historyFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    historyFrame.Parent = main
+    
+    local historyCorner = Instance.new("UICorner")
+    historyCorner.CornerRadius = UDim.new(0, 6)
+    historyCorner.Parent = historyFrame
+    
+    local historyLayout = Instance.new("UIListLayout")
+    historyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    historyLayout.Padding = UDim.new(0, 4)
+    historyLayout.Parent = historyFrame
+    
+    local historyPadding = Instance.new("UIPadding")
+    historyPadding.PaddingTop = UDim.new(0, 6)
+    historyPadding.PaddingLeft = UDim.new(0, 8)
+    historyPadding.PaddingRight = UDim.new(0, 8)
+    historyPadding.Parent = historyFrame
+    
+    local logLabelTitle = Gui.createLabel(main, "Лог:", UDim2.new(0, 12, 0, 322), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
+    
+    local logFrame = Instance.new("ScrollingFrame")
+    logFrame.Size = UDim2.new(1, -24, 0, 110)
+    logFrame.Position = UDim2.new(0, 12, 0, 344)
+    logFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    logFrame.BorderSizePixel = 0
+    logFrame.ScrollBarThickness = 4
+    logFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    logFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    logFrame.Parent = main
+    
+    local logCorner = Instance.new("UICorner")
+    logCorner.CornerRadius = UDim.new(0, 6)
+    logCorner.Parent = logFrame
+    
+    local logLabel = Instance.new("TextLabel")
+    logLabel.Size = UDim2.new(1, -12, 0, 0)
+    logLabel.Position = UDim2.new(0, 6, 0, 6)
+    logLabel.BackgroundTransparency = 1
+    logLabel.Text = ""
+    logLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    logLabel.TextSize = 11
+    logLabel.Font = Enum.Font.Code
+    logLabel.TextXAlignment = Enum.TextXAlignment.Left
+    logLabel.TextYAlignment = Enum.TextYAlignment.Top
+    logLabel.TextWrapped = true
+    logLabel.AutomaticSize = Enum.AutomaticSize.Y
+    logLabel.Size = UDim2.new(1, -12, 0, 0)
+    logLabel.Parent = logFrame
+    
+    State.Gui = {
+        ScreenGui = screenGui,
+        Main = main,
+        StatusLabel = statusLabel,
+        InfoLabel = infoLabel,
+        StatsLabel = statsLabel,
+        HistoryFrame = historyFrame,
+        LogFrame = logFrame,
+        LogLabel = logLabel,
+        TitleBar = titleBar,
+    }
+    
+    return State.Gui
+end
+
+function Gui.refreshHistory()
+    if not State.Gui or not State.Gui.HistoryFrame then return end
+    for _, child in ipairs(State.Gui.HistoryFrame:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("TextLabel") then
+            child:Destroy()
+        end
+    end
+    for i, part in ipairs(State.History) do
+        if part and part.Parent then
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, 22)
+            btn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+            btn.BorderSizePixel = 0
+            btn.Text = string.format("%d. %s", i, part.Name)
+            btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+            btn.TextSize = 12
+            btn.Font = Enum.Font.Gotham
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.Parent = State.Gui.HistoryFrame
+            local pad = Instance.new("UIPadding")
+            pad.PaddingLeft = UDim.new(0, 6)
+            pad.Parent = btn
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 4)
+            corner.Parent = btn
+            btn.MouseButton1Click:Connect(function()
+                Core.becomePart(part)
+            end)
+        end
+    end
+end
+
+function Gui.toggle()
+    if not State.Gui or not State.Gui.Main then return end
+    State.GuiVisible = not State.GuiVisible
+    State.Gui.Main.Visible = State.GuiVisible
+end
+
+function Gui.updateStats()
+    if not State.Gui or not State.Gui.StatsLabel then return end
+    State.Gui.StatsLabel.Text = string.format("Клики: %d | Захваты: %d | Отпуски: %d | Ошибки: %d",
+        State.Stats.Clicks,
+        State.Stats.Captures,
+        State.Stats.Releases,
+        State.Stats.Errors
+    )
+end
+
+local Input = {}
+
+function Input.setup()
+    State.InputConnection = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == CONFIG.KEY_TOGGLE_GUI then
+            Gui.toggle()
+        elseif input.KeyCode == CONFIG.KEY_RELEASE then
+            Core.release()
+        elseif input.KeyCode == CONFIG.KEY_AUTO_CATCH then
+            Core.autoCatch()
+        elseif input.KeyCode == CONFIG.KEY_TELEPORT then
+            Core.teleportToPart()
+        end
+    end)
+end
+
+function Input.setupClick()
+    State.ClickConnection = Mouse.Button1Down:Connect(function()
+        State.Stats.Clicks = State.Stats.Clicks + 1
+        Gui.updateStats()
+        local target = Mouse.Target
+        if target and target:IsA("BasePart") then
+            Core.becomePart(target)
+            Gui.refreshHistory()
+        end
+    end)
+end
+
+local Init = {}
+
+function Init.start()
+    Logger.info("Запуск Part Control v2.0")
+    Logger.info(string.format("Клавиши: %s — GUI, %s — отпустить, %s — автозахват, %s — телепорт",
+        CONFIG.KEY_TOGGLE_GUI.Name,
+        CONFIG.KEY_RELEASE.Name,
+        CONFIG.KEY_AUTO_CATCH.Name,
+        CONFIG.KEY_TELEPORT.Name
+    ))
+    Gui.build()
+    Gui.updateStats()
+    Input.setup()
+    Input.setupClick()
+    Logger.success("Скрипт успешно загружен")
+end
+
+function Init.stop()
+    Logger.info("Остановка скрипта")
+    Core.release()
+    if State.InputConnection then State.InputConnection:Disconnect() end
+    if State.ClickConnection then State.ClickConnection:Disconnect() end
+    if State.Gui and State.Gui.ScreenGui then State.Gui.ScreenGui:Destroy() end
+    State.Gui = nil
+    Logger.success("Скрипт остановлен")
+end
+
+Init.start()
+
+return Init.stop
