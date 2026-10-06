@@ -9,17 +9,17 @@ local Mouse = LocalPlayer:GetMouse()
 local CONFIG = {
     COLOR_OWNED = Color3.fromRGB(0, 255, 0),
     COLOR_NOT_OWNED = Color3.fromRGB(150, 150, 150),
+    COLOR_OWNER_LABEL = Color3.fromRGB(255, 220, 0),
     FILL_TRANSPARENCY = 0.7,
     OUTLINE_TRANSPARENCY = 0.3,
     GUI_NAME = "PartControlGui",
-    GUI_TITLE = "Part Control v2.0",
-    GUI_SIZE = UDim2.new(0, 320, 0, 460),
+    GUI_TITLE = "Part Control v2.1",
+    GUI_SIZE = UDim2.new(0, 340, 0, 500),
     GUI_POSITION = UDim2.new(0, 20, 0, 20),
     KEY_TOGGLE_GUI = Enum.KeyCode.RightControl,
     KEY_RELEASE = Enum.KeyCode.R,
     KEY_AUTO_CATCH = Enum.KeyCode.F,
     KEY_TELEPORT = Enum.KeyCode.T,
-    KEY_HISTORY = Enum.KeyCode.H,
     AUTO_CATCH_RADIUS = 50,
     MAX_HISTORY = 10,
     LOG_MAX_LINES = 50,
@@ -30,6 +30,8 @@ local State = {
     CurrentPart = nil,
     CurrentHighlight = nil,
     CurrentWeld = nil,
+    OwnerBillboard = nil,
+    OwnerLabel = nil,
     CharacterConnection = nil,
     HeartbeatConnection = nil,
     InputConnection = nil,
@@ -46,9 +48,6 @@ local State = {
         StartTime = tick(),
     },
     LastHeartbeatUpdate = 0,
-    Dragging = false,
-    DragStart = nil,
-    DragStartPos = nil,
 }
 
 local Utils = {}
@@ -133,6 +132,28 @@ function Utils.findNearestPart()
         end
     end
     return nearest
+end
+
+function Utils.getOwnerName(part)
+    if not part then return "—" end
+    local ok, owner = pcall(function()
+        return part:GetNetworkOwner()
+    end)
+    if ok and owner then
+        return owner.Name
+    end
+    return "Сервер / Неизвестно"
+end
+
+function Utils.findPlayerWhoOwns(part)
+    if not part then return nil end
+    local ok, owner = pcall(function()
+        return part:GetNetworkOwner()
+    end)
+    if ok and owner then
+        return owner
+    end
+    return nil
 end
 
 local Logger = {}
@@ -228,6 +249,79 @@ function Highlight.destroy()
     State.CurrentHighlight = nil
 end
 
+local OwnerView = {}
+
+function OwnerView.create(part)
+    OwnerView.destroy()
+    if not part or not part.Parent then return end
+    
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "PartOwnerBillboard"
+    billboard.Size = UDim2.new(0, 220, 0, 36)
+    billboard.StudsOffset = Vector3.new(0, 3, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 500
+    billboard.Adornee = part
+    billboard.Parent = part
+    
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 1, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
+    frame.BackgroundTransparency = 0.2
+    frame.BorderSizePixel = 0
+    frame.Parent = billboard
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+    
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = CONFIG.COLOR_OWNER_LABEL
+    stroke.Thickness = 1
+    stroke.Parent = frame
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -8, 1, 0)
+    label.Position = UDim2.new(0, 4, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "Владелец: " .. Utils.getOwnerName(part)
+    label.TextColor3 = CONFIG.COLOR_OWNER_LABEL
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamBold
+    label.TextWrapped = true
+    label.Parent = frame
+    
+    State.OwnerBillboard = billboard
+    State.OwnerLabel = label
+end
+
+function OwnerView.update(part)
+    if not State.OwnerBillboard or not State.OwnerBillboard.Parent then return end
+    if not part or not part.Parent then return end
+    
+    local player = Utils.findPlayerWhoOwns(part)
+    if player then
+        if player == LocalPlayer then
+            State.OwnerLabel.Text = "Владелец: ВЫ (клиент)"
+            State.OwnerLabel.TextColor3 = CONFIG.COLOR_OWNED
+        else
+            State.OwnerLabel.Text = "Владелец: " .. player.Name
+            State.OwnerLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+        end
+    else
+        State.OwnerLabel.Text = "Владелец: Сервер"
+        State.OwnerLabel.TextColor3 = CONFIG.COLOR_NOT_OWNED
+    end
+end
+
+function OwnerView.destroy()
+    if State.OwnerBillboard and State.OwnerBillboard.Parent then
+        State.OwnerBillboard:Destroy()
+    end
+    State.OwnerBillboard = nil
+    State.OwnerLabel = nil
+end
+
 local Weld = {}
 
 function Weld.attach(rootPart, targetPart)
@@ -254,37 +348,6 @@ end
 
 local Core = {}
 
-function Core.release()
-    if State.CharacterConnection then
-        State.CharacterConnection:Disconnect()
-        State.CharacterConnection = nil
-    end
-    if State.HeartbeatConnection then
-        State.HeartbeatConnection:Disconnect()
-        State.HeartbeatConnection = nil
-    end
-    Highlight.destroy()
-    Weld.detach()
-    if State.CurrentPart then
-        Logger.info("Отпущен парт: " .. State.CurrentPart.Name)
-        State.Stats.Releases = State.Stats.Releases + 1
-    end
-    State.CurrentPart = nil
-    if State.Gui and State.Gui.StatusLabel then
-        State.Gui.StatusLabel.Text = "Статус: свободен"
-        State.Gui.StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-    end
-end
-
-function Core.attachWeldOnRespawn(newCharacter)
-    if not State.CurrentPart or not State.CurrentPart.Parent then return end
-    local newRoot = newCharacter:WaitForChild("HumanoidRootPart", 5)
-    if newRoot then
-        Weld.attach(newRoot, State.CurrentPart)
-        Logger.info("Персонаж перепривязан после респавна")
-    end
-end
-
 function Core.becomePart(part)
     if not Utils.isPartValid(part) then
         Logger.warn("Парт невалиден или заанкорен")
@@ -298,34 +361,48 @@ function Core.becomePart(part)
         Logger.info("Уже управляете этим партом")
         return false
     end
+    
     Core.release()
+    
     State.CurrentPart = part
     History.add(part)
     State.Stats.Captures = State.Stats.Captures + 1
+    
     Highlight.create(part)
     Highlight.update(part)
+    OwnerView.create(part)
+    OwnerView.update(part)
+    
     local rootPart = Utils.getRootPart()
     if not rootPart then
         Logger.error("Не найден HumanoidRootPart")
         return false
     end
+    
     Weld.attach(rootPart, part)
+    
     State.HeartbeatConnection = RunService.Heartbeat:Connect(function()
         local now = tick()
         if now - State.LastHeartbeatUpdate < CONFIG.HEARTBEAT_UPDATE_RATE then
             return
         end
         State.LastHeartbeatUpdate = now
+        
         if State.CurrentPart and State.CurrentPart.Parent then
             Highlight.update(State.CurrentPart)
+            OwnerView.update(State.CurrentPart)
+            
             if State.Gui and State.Gui.InfoLabel then
                 local root = Utils.getRootPart()
                 if root then
                     local d = Utils.round(Utils.distance(root, State.CurrentPart), 1)
-                    State.Gui.InfoLabel.Text = string.format("Парт: %s | Дист: %s | Скор: %s",
+                    local owner = Utils.getOwnerName(State.CurrentPart)
+                    State.Gui.InfoLabel.Text = string.format(
+                        "Парт: %s | Дист: %s | Скор: %s | Владелец: %s",
                         State.CurrentPart.Name,
                         tostring(d),
-                        tostring(Utils.round(State.CurrentPart.AssemblyLinearVelocity.Magnitude, 1))
+                        tostring(Utils.round(State.CurrentPart.AssemblyLinearVelocity.Magnitude, 1)),
+                        owner
                     )
                 end
             end
@@ -333,15 +410,47 @@ function Core.becomePart(part)
             Core.release()
         end
     end)
+    
     State.CharacterConnection = LocalPlayer.CharacterAdded:Connect(function(newCharacter)
-        Core.attachWeldOnRespawn(newCharacter)
+        if State.CurrentPart and State.CurrentPart.Parent then
+            local newRoot = newCharacter:WaitForChild("HumanoidRootPart", 5)
+            if newRoot then
+                Weld.attach(newRoot, State.CurrentPart)
+                Logger.info("Персонаж перепривязан после респавна")
+            end
+        end
     end)
+    
     if State.Gui and State.Gui.StatusLabel then
         State.Gui.StatusLabel.Text = "Статус: управляю " .. part.Name
         State.Gui.StatusLabel.TextColor3 = CONFIG.COLOR_OWNED
     end
+    
     Logger.success("Теперь вы управляете партом: " .. part.Name)
     return true
+end
+
+function Core.release()
+    if State.CharacterConnection then
+        State.CharacterConnection:Disconnect()
+        State.CharacterConnection = nil
+    end
+    if State.HeartbeatConnection then
+        State.HeartbeatConnection:Disconnect()
+        State.HeartbeatConnection = nil
+    end
+    Highlight.destroy()
+    Weld.detach()
+    OwnerView.destroy()
+    if State.CurrentPart then
+        Logger.info("Отпущен парт: " .. State.CurrentPart.Name)
+        State.Stats.Releases = State.Stats.Releases + 1
+    end
+    State.CurrentPart = nil
+    if State.Gui and State.Gui.StatusLabel then
+        State.Gui.StatusLabel.Text = "Статус: свободен"
+        State.Gui.StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    end
 end
 
 function Core.teleportToPart()
@@ -365,6 +474,23 @@ function Core.autoCatch()
     end
 end
 
+function Core.showOwnerOfTarget()
+    local target = Mouse.Target
+    if not target or not target:IsA("BasePart") then
+        Logger.warn("Наведите на парт")
+        return
+    end
+    local owner = Utils.getOwnerName(target)
+    local player = Utils.findPlayerWhoOwns(target)
+    if player == LocalPlayer then
+        Logger.success("Владелец " .. target.Name .. ": ВЫ (клиент)")
+    elseif player then
+        Logger.info("Владелец " .. target.Name .. ": " .. player.Name)
+    else
+        Logger.info("Владелец " .. target.Name .. ": Сервер")
+    end
+end
+
 local Gui = {}
 
 function Gui.createButton(parent, text, position, size, color, callback)
@@ -375,30 +501,25 @@ function Gui.createButton(parent, text, position, size, color, callback)
     btn.BorderSizePixel = 0
     btn.Text = text
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.TextSize = 14
+    btn.TextSize = 13
     btn.Font = Enum.Font.GothamBold
     btn.Parent = parent
-    
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, 6)
     corner.Parent = btn
-    
     btn.MouseEnter:Connect(function()
         TweenService:Create(btn, TweenInfo.new(0.15), {
             BackgroundColor3 = Color3.fromRGB(70, 70, 90)
         }):Play()
     end)
-    
     btn.MouseLeave:Connect(function()
         TweenService:Create(btn, TweenInfo.new(0.15), {
             BackgroundColor3 = color or Color3.fromRGB(45, 45, 55)
         }):Play()
     end)
-    
     btn.MouseButton1Click:Connect(function()
         Utils.safeCall(callback)
     end)
-    
     return btn
 end
 
@@ -481,9 +602,7 @@ function Gui.build()
     title.Parent = titleBar
     
     local statusLabel = Gui.createLabel(main, "Статус: свободен", UDim2.new(0, 12, 0, 46), UDim2.new(1, -24, 0, 22), 14, Color3.fromRGB(200, 200, 200))
-    
-    local infoLabel = Gui.createLabel(main, "Парт: — | Дист: — | Скор: —", UDim2.new(0, 12, 0, 68), UDim2.new(1, -24, 0, 20), 12, Color3.fromRGB(170, 170, 190))
-    
+    local infoLabel = Gui.createLabel(main, "Парт: — | Дист: — | Скор: — | Владелец: —", UDim2.new(0, 12, 0, 68), UDim2.new(1, -24, 0, 20), 11, Color3.fromRGB(170, 170, 190))
     local statsLabel = Gui.createLabel(main, "Клики: 0 | Захваты: 0 | Отпуски: 0", UDim2.new(0, 12, 0, 90), UDim2.new(1, -24, 0, 20), 12, Color3.fromRGB(150, 200, 150))
     
     local separator = Instance.new("Frame")
@@ -493,28 +612,42 @@ function Gui.build()
     separator.BorderSizePixel = 0
     separator.Parent = main
     
-    local btn1 = Gui.createButton(main, "Захватить ближайший [F]", UDim2.new(0, 12, 0, 126), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(40, 80, 50), function()
-        Core.autoCatch()
+    Gui.createButton(main, "Стать партом (клик по миру)", UDim2.new(0, 12, 0, 126), UDim2.new(1, -24, 0, 32), Color3.fromRGB(50, 90, 60), function()
+        Logger.info("Кликните по парту в мире, чтобы стать им")
     end)
     
-    local btn2 = Gui.createButton(main, "Отпустить [R]", UDim2.new(0.5, 6, 0, 126), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(80, 40, 40), function()
+    Gui.createButton(main, "Захватить ближайший [F]", UDim2.new(0, 12, 0, 164), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(40, 80, 50), function()
+        Core.autoCatch()
+        Gui.refreshHistory()
+    end)
+    
+    Gui.createButton(main, "Отпустить [R]", UDim2.new(0.5, 6, 0, 164), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(80, 40, 40), function()
         Core.release()
     end)
     
-    local btn3 = Gui.createButton(main, "Телепорт к парту [T]", UDim2.new(0, 12, 0, 168), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(40, 60, 100), function()
+    Gui.createButton(main, "Телепорт к парту [T]", UDim2.new(0, 12, 0, 204), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(40, 60, 100), function()
         Core.teleportToPart()
     end)
     
-    local btn4 = Gui.createButton(main, "Очистить историю", UDim2.new(0.5, 6, 0, 168), UDim2.new(0.5, -18, 0, 34), Color3.fromRGB(60, 60, 60), function()
+    Gui.createButton(main, "Кто владеет? [O]", UDim2.new(0.5, 6, 0, 204), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(100, 80, 40), function()
+        Core.showOwnerOfTarget()
+    end)
+    
+    Gui.createButton(main, "Очистить историю", UDim2.new(0, 12, 0, 244), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(60, 60, 60), function()
         History.clear()
+        Gui.refreshHistory()
         Logger.info("История очищена")
     end)
     
-    local historyLabel = Gui.createLabel(main, "История:", UDim2.new(0, 12, 0, 212), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
+    Gui.createButton(main, "Скрыть GUI [Ctrl]", UDim2.new(0.5, 6, 0, 244), UDim2.new(0.5, -18, 0, 32), Color3.fromRGB(60, 60, 60), function()
+        Gui.toggle()
+    end)
+    
+    Gui.createLabel(main, "История:", UDim2.new(0, 12, 0, 286), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
     
     local historyFrame = Instance.new("ScrollingFrame")
-    historyFrame.Size = UDim2.new(1, -24, 0, 80)
-    historyFrame.Position = UDim2.new(0, 12, 0, 234)
+    historyFrame.Size = UDim2.new(1, -24, 0, 70)
+    historyFrame.Position = UDim2.new(0, 12, 0, 306)
     historyFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
     historyFrame.BorderSizePixel = 0
     historyFrame.ScrollBarThickness = 4
@@ -537,11 +670,11 @@ function Gui.build()
     historyPadding.PaddingRight = UDim.new(0, 8)
     historyPadding.Parent = historyFrame
     
-    local logLabelTitle = Gui.createLabel(main, "Лог:", UDim2.new(0, 12, 0, 322), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
+    Gui.createLabel(main, "Лог:", UDim2.new(0, 12, 0, 384), UDim2.new(1, -24, 0, 18), 13, Color3.fromRGB(220, 220, 220))
     
     local logFrame = Instance.new("ScrollingFrame")
-    logFrame.Size = UDim2.new(1, -24, 0, 110)
-    logFrame.Position = UDim2.new(0, 12, 0, 344)
+    logFrame.Size = UDim2.new(1, -24, 0, 100)
+    logFrame.Position = UDim2.new(0, 12, 0, 404)
     logFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
     logFrame.BorderSizePixel = 0
     logFrame.ScrollBarThickness = 4
@@ -565,7 +698,6 @@ function Gui.build()
     logLabel.TextYAlignment = Enum.TextYAlignment.Top
     logLabel.TextWrapped = true
     logLabel.AutomaticSize = Enum.AutomaticSize.Y
-    logLabel.Size = UDim2.new(1, -12, 0, 0)
     logLabel.Parent = logFrame
     
     State.Gui = {
@@ -610,6 +742,7 @@ function Gui.refreshHistory()
             corner.Parent = btn
             btn.MouseButton1Click:Connect(function()
                 Core.becomePart(part)
+                Gui.refreshHistory()
             end)
         end
     end
@@ -642,8 +775,11 @@ function Input.setup()
             Core.release()
         elseif input.KeyCode == CONFIG.KEY_AUTO_CATCH then
             Core.autoCatch()
+            Gui.refreshHistory()
         elseif input.KeyCode == CONFIG.KEY_TELEPORT then
             Core.teleportToPart()
+        elseif input.KeyCode == Enum.KeyCode.O then
+            Core.showOwnerOfTarget()
         end
     end)
 end
@@ -663,28 +799,22 @@ end
 local Init = {}
 
 function Init.start()
-    Logger.info("Запуск Part Control v2.0")
-    Logger.info(string.format("Клавиши: %s — GUI, %s — отпустить, %s — автозахват, %s — телепорт",
-        CONFIG.KEY_TOGGLE_GUI.Name,
-        CONFIG.KEY_RELEASE.Name,
-        CONFIG.KEY_AUTO_CATCH.Name,
-        CONFIG.KEY_TELEPORT.Name
-    ))
+    Logger.info("Запуск Part Control v2.1")
+    Logger.info("Клавиши: Ctrl — GUI, R — отпустить, F — автозахват, T — телепорт, O — владелец")
     Gui.build()
     Gui.updateStats()
     Input.setup()
     Input.setupClick()
-    Logger.success("Скрипт успешно загружен")
+    Logger.success("Скрипт загружен")
 end
 
 function Init.stop()
-    Logger.info("Остановка скрипта")
+    Logger.info("Остановка")
     Core.release()
     if State.InputConnection then State.InputConnection:Disconnect() end
     if State.ClickConnection then State.ClickConnection:Disconnect() end
     if State.Gui and State.Gui.ScreenGui then State.Gui.ScreenGui:Destroy() end
     State.Gui = nil
-    Logger.success("Скрипт остановлен")
 end
 
 Init.start()
