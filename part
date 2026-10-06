@@ -1,0 +1,172 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+local CurrentPart = nil
+local CurrentHighlight = nil
+local CharacterConnection = nil
+local PartConnection = nil
+local HeartbeatConnection = nil
+
+local COLOR_OWNED = Color3.fromRGB(0, 255, 0)
+local COLOR_NOT_OWNED = Color3.fromRGB(150, 150, 150)
+
+local function ReleaseCurrentPart()
+    if CharacterConnection then
+        CharacterConnection:Disconnect()
+        CharacterConnection = nil
+    end
+
+    if PartConnection then
+        PartConnection:Disconnect()
+        PartConnection = nil
+    end
+
+    if HeartbeatConnection then
+        HeartbeatConnection:Disconnect()
+        HeartbeatConnection = nil
+    end
+
+    if CurrentHighlight and CurrentHighlight.Parent then
+        CurrentHighlight:Destroy()
+    end
+    CurrentHighlight = nil
+
+    if CurrentPart then
+        local character = LocalPlayer.Character
+        if character then
+            local rootPart = character:FindFirstChild("HumanoidRootPart")
+            if rootPart then
+                local weld = rootPart:FindFirstChild("PartWeld")
+                if weld then
+                    weld:Destroy()
+                end
+            end
+        end
+    end
+
+    CurrentPart = nil
+end
+
+local function IsClientOwned(part)
+    if part == CurrentPart then
+        return true
+    end
+
+    if part.ReceiveAge ~= nil then
+        return part.ReceiveAge < 0.1
+    end
+
+    return false
+end
+
+local function UpdateHighlight(part)
+    if not part or not part.Parent then return end
+
+    if not CurrentHighlight or CurrentHighlight.Adornee ~= part then
+        if CurrentHighlight then
+            CurrentHighlight:Destroy()
+        end
+
+        CurrentHighlight = Instance.new("Highlight")
+        CurrentHighlight.Adornee = part
+        CurrentHighlight.FillTransparency = 0.7
+        CurrentHighlight.OutlineTransparency = 0.3
+        CurrentHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        CurrentHighlight.Parent = part
+    end
+
+    if IsClientOwned(part) then
+        CurrentHighlight.FillColor = COLOR_OWNED
+        CurrentHighlight.OutlineColor = COLOR_OWNED
+    else
+        CurrentHighlight.FillColor = COLOR_NOT_OWNED
+        CurrentHighlight.OutlineColor = COLOR_NOT_OWNED
+    end
+end
+
+local function BecomePart(part)
+    if not part or not part:IsA("BasePart") then return end
+    if part.Anchored then
+        warn("Парт заанкорен, нельзя забрать владение")
+        return
+    end
+
+    ReleaseCurrentPart()
+
+    CurrentPart = part
+
+    UpdateHighlight(part)
+
+    local character = LocalPlayer.Character
+    if not character then return end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+
+    if not rootPart then return end
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "PartWeld"
+    weld.Part0 = rootPart
+    weld.Part1 = part
+    weld.Parent = rootPart
+
+    PartConnection = RunService.Heartbeat:Connect(function()
+        if CurrentPart and CurrentPart.Parent then
+            UpdateHighlight(CurrentPart)
+        else
+            ReleaseCurrentPart()
+        end
+    end)
+
+    HeartbeatConnection = RunService.Heartbeat:Connect(function()
+        if CurrentPart and CurrentPart.Parent then
+            local char = LocalPlayer.Character
+            if char then
+                local rp = char:FindFirstChild("HumanoidRootPart")
+                if rp then
+                    local existingWeld = rp:FindFirstChild("PartWeld")
+                    if not existingWeld then
+                        local newWeld = Instance.new("WeldConstraint")
+                        newWeld.Name = "PartWeld"
+                        newWeld.Part0 = rp
+                        newWeld.Part1 = CurrentPart
+                        newWeld.Parent = rp
+                    end
+                end
+            end
+        end
+    end)
+
+    CharacterConnection = LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+        if CurrentPart and CurrentPart.Parent then
+            local newRoot = newCharacter:WaitForChild("HumanoidRootPart", 5)
+            if newRoot then
+                local newWeld = Instance.new("WeldConstraint")
+                newWeld.Name = "PartWeld"
+                newWeld.Part0 = newRoot
+                newWeld.Part1 = CurrentPart
+                newWeld.Parent = newRoot
+            end
+        end
+    end)
+
+    print("Теперь вы управляете партом:", part.Name)
+end
+
+Mouse.Button1Down:Connect(function()
+    local target = Mouse.Target
+    if target and target:IsA("BasePart") then
+        BecomePart(target)
+    end
+end)
+
+local function Cleanup()
+    ReleaseCurrentPart()
+end
+
+return Cleanup
